@@ -1,0 +1,22 @@
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+*.env
+# User-specific directory
+# This single line ignores the entire 'user' folder and everything inside it.
+user_images/
+BK/
+1 - BK/
+data_cache/
+# Virtual Environment
+# This ensures the local venv folder is not uploaded to the repo.
+yuuka_venv/
+.venv/
+venv/
+
+# IDE/Editor specific files
+.vscode/
+.idea/
