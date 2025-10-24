@@ -35,7 +35,7 @@ class YuukaLoraDownloader:
     RETURN_TYPES = ("STRING",)
     RETURN_NAMES = ("lora_name",)
     FUNCTION = "download_lora"
-    CATEGORY = "yuuka_nodes/Loaders"
+    CATEGORY = "yuuka-comfyui/Loaders"
     OUTPUT_NODE = True
 
     def _get_api_key(self, api_key_input: str) -> str:

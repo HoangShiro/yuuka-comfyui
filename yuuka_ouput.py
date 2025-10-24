@@ -28,7 +28,7 @@ class ImageToBase64_Yuuka:
 
     RETURN_TYPES = ()
     FUNCTION = "encode_base64"
-    CATEGORY = "Yuuka Tools"
+    CATEGORY = "yuuka-comfyui/Tools"
 
     def encode_base64(self, images):
         results = []
