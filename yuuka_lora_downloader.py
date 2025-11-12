@@ -17,6 +17,9 @@ class YuukaLoraDownloader:
     frontends informed about the progress by emitting websocket events.
     """
 
+    # Hard safety cap: auto-cancel a task that runs longer than this (seconds)
+    DEFAULT_MAX_SECONDS = 180
+
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -75,6 +78,9 @@ class YuukaLoraDownloader:
             print(f"[Yuuka Lora Downloader] {error_msg}")
             self._emit_status(tracking_id, "error", error_msg)
             return (error_msg,)
+
+        # Establish a hard deadline for the entire task (fail-safe against hanging jobs)
+        deadline = time.monotonic() + self.DEFAULT_MAX_SECONDS
 
         match = re.search(r"/models/(\d+)", civitai_url.strip())
         if not match:
@@ -157,6 +163,7 @@ class YuukaLoraDownloader:
                 tracking_id,
                 lora_filename,
                 expected_bytes,
+                deadline,
             )
             print(f"[Yuuka Lora Downloader] Download finished for '{lora_filename}'.")
             self._save_metadata(model_data, loras_dir, lora_filename)
@@ -169,6 +176,22 @@ class YuukaLoraDownloader:
                 model_data=model_data,
             )
             return (lora_filename,)
+        except TimeoutError as exc:
+            # Specific handling for deadline exceed: remove partial and report cancelled
+            error_msg = f"Task cancelled after timeout: {exc}"
+            print(f"[Yuuka Lora Downloader] {error_msg}")
+            if os.path.exists(file_path):
+                try:
+                    os.remove(file_path)
+                except OSError:
+                    pass
+            self._emit_status(
+                tracking_id,
+                "cancelled",
+                "Download cancelled due to 3-minute timeout.",
+                filename=lora_filename,
+            )
+            return ("Timeout: download cancelled",)
         except Exception as exc:
             error_msg = f"Loi khi tai/ghi file: {exc}"
             print(f"[Yuuka Lora Downloader] {error_msg}")
@@ -202,6 +225,7 @@ class YuukaLoraDownloader:
         tracking_id: str,
         filename: str,
         expected_bytes: int,
+        deadline: float,
     ):
         downloaded = 0
         last_emit = time.monotonic()
@@ -221,6 +245,17 @@ class YuukaLoraDownloader:
                 for chunk in response.iter_content(chunk_size=8192):
                     if not chunk:
                         continue
+                    # Enforce wall-clock deadline regardless of network activity
+                    if time.monotonic() > deadline:
+                        self._emit_status(
+                            tracking_id,
+                            "cancelled",
+                            "Cancelling: exceeded 3-minute limit.",
+                            filename=filename,
+                            bytes_downloaded=downloaded,
+                            total_bytes=expected_bytes,
+                        )
+                        raise TimeoutError("exceeded 180 seconds")
                     handle.write(chunk)
                     downloaded += len(chunk)
                     percent = None
