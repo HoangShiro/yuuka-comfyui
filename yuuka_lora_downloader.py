@@ -167,6 +167,7 @@ class YuukaLoraDownloader:
             )
             print(f"[Yuuka Lora Downloader] Download finished for '{lora_filename}'.")
             self._save_metadata(model_data, loras_dir, lora_filename)
+            _invalidate_comfy_loras_cache()
             self._emit_status(
                 tracking_id,
                 "completed",
@@ -364,6 +365,18 @@ def _get_loras_directories() -> list[str]:
     return normalized if normalized else [user_doc_path]
 
 
+def _invalidate_comfy_loras_cache():
+    """Invalidate ComfyUI's internal folder cache so newly added/deleted LoRAs are immediately recognized."""
+    try:
+        if hasattr(folder_paths, "filename_list_cache") and isinstance(folder_paths.filename_list_cache, dict):
+            folder_paths.filename_list_cache.pop("loras", None)
+            folder_paths.filename_list_cache.clear()
+        if hasattr(folder_paths, "get_filename_list"):
+            folder_paths.get_filename_list("loras")
+    except Exception:
+        pass
+
+
 def _get_primary_loras_directory() -> str:
     """Return the preferred directory for saving new LoRAs."""
     dirs = _get_loras_directories()
@@ -447,6 +460,7 @@ async def yuuka_lora_delete(request):
         return web.json_response({"deleted": False, "error": "Missing filename"}, status=400)
 
     result = await _delete_lora_files(filename)
+    _invalidate_comfy_loras_cache()
     status = 200 if result.get("deleted") or "LoRA file not found" in result.get("errors", []) else 500
     if "LoRA file not found" in result.get("errors", []):
         status = 200
@@ -581,6 +595,7 @@ async def yuuka_lora_thumbnail(request):
 @PromptServer.instance.routes.get("/yuuka/lora/models")
 async def yuuka_lora_models(_request):
     """Return all LoRAs available on disk with their sidecar metadata and cached thumbnail URLs."""
+    _invalidate_comfy_loras_cache()
     all_dirs = _get_loras_directories()
     models = {}
 
