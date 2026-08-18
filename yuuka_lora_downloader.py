@@ -129,7 +129,7 @@ class YuukaLoraDownloader:
         expected_size_kb = valid_file_info.get("sizeKB", 0)
         expected_bytes = int(expected_size_kb * 1024)
 
-        loras_dir = folder_paths.get_folder_paths("loras")[0]
+        loras_dir = _get_primary_loras_directory()
         file_path = os.path.join(loras_dir, lora_filename)
 
         self._emit_status(
@@ -275,14 +275,65 @@ class YuukaLoraDownloader:
                         last_emit = now
                         last_percent = percent if percent is not None else last_percent
 
-    def _save_metadata(self, model_data: dict, loras_dir: str, lora_filename: str):
-        info_path = os.path.join(loras_dir, f"{os.path.splitext(lora_filename)[0]}.json")
+    def _cache_thumbnail(self, preview_url: str, lora_dir: str, stem: str, headers: dict = None):
+        """Download and cache the LoRA preview thumbnail into its dedicated folder."""
+        if not preview_url:
+            return None
         try:
-            with open(info_path, "w", encoding="utf-8") as handle:
+            os.makedirs(lora_dir, exist_ok=True)
+            thumb_path = os.path.join(lora_dir, f"{stem}.jpg")
+            thumb_generic = os.path.join(lora_dir, "thumbnail.jpg")
+
+            if os.path.isfile(thumb_path) and os.path.getsize(thumb_path) > 0:
+                return thumb_path
+
+            resp = requests.get(preview_url, headers=headers or {}, timeout=25)
+            if resp.status_code == 200 and len(resp.content) > 0:
+                with open(thumb_path, "wb") as handle:
+                    handle.write(resp.content)
+                with open(thumb_generic, "wb") as handle:
+                    handle.write(resp.content)
+                print(f"[Yuuka Lora Downloader] Cached thumbnail for '{stem}' in {lora_dir}.")
+                return thumb_path
+        except Exception as exc:
+            print(f"[Yuuka Lora Downloader] Failed to cache thumbnail for '{stem}': {exc}")
+        return None
+
+    def _save_metadata(self, model_data: dict, loras_dir: str, lora_filename: str, headers: dict = None):
+        stem = os.path.splitext(lora_filename)[0]
+        # Dedicated folder for each LoRA's metadata and thumbnail assets
+        lora_dir = os.path.join(loras_dir, stem)
+        os.makedirs(lora_dir, exist_ok=True)
+
+        # 1. Save metadata into LoRA's dedicated folder
+        dedicated_info_path = os.path.join(lora_dir, f"{stem}.json")
+        dedicated_meta_path = os.path.join(lora_dir, "metadata.json")
+        legacy_info_path = os.path.join(loras_dir, f"{stem}.json")
+
+        try:
+            with open(dedicated_info_path, "w", encoding="utf-8") as handle:
                 json.dump(model_data, handle, indent=4)
-            print(f"[Yuuka Lora Downloader] Metadata saved for {lora_filename}.")
+            with open(dedicated_meta_path, "w", encoding="utf-8") as handle:
+                json.dump(model_data, handle, indent=4)
+            # Also maintain legacy root sidecar for backwards compatibility
+            with open(legacy_info_path, "w", encoding="utf-8") as handle:
+                json.dump(model_data, handle, indent=4)
+            print(f"[Yuuka Lora Downloader] Metadata saved in '{lora_dir}'.")
         except Exception as exc:
             print(f"[Yuuka Lora Downloader] Failed to write metadata: {exc}")
+
+        # 2. Extract and cache thumbnail image into the dedicated folder
+        preview_url = ""
+        versions = model_data.get("modelVersions", [])
+        if versions and isinstance(versions, list) and isinstance(versions[0], dict):
+            imgs = versions[0].get("images", [])
+            if imgs and isinstance(imgs, list) and isinstance(imgs[0], dict):
+                preview_url = imgs[0].get("url") or ""
+        if not preview_url and model_data.get("preview_url"):
+            preview_url = model_data.get("preview_url")
+
+        if preview_url:
+            self._cache_thumbnail(preview_url, lora_dir, stem, headers=headers)
 
 
 NODE_CLASS_MAPPINGS = {
@@ -298,63 +349,94 @@ NODE_DISPLAY_NAME_MAPPINGS = {
 # Additional server endpoints
 # ----------------------------
 
-def _get_loras_directory() -> str:
-    paths = folder_paths.get_folder_paths("loras")
-    if not paths:
-        raise RuntimeError("LoRA directory not configured")
-    return paths[0]
+def _get_loras_directories() -> list[str]:
+    """Return all configured LoRA directories, ensuring user documents folder is included."""
+    paths = folder_paths.get_folder_paths("loras") or []
+    user_doc_path = os.path.normpath("C:/Users/nyaac/Documents/ComfyUI/models/loras")
+    normalized = []
+    for p in paths:
+        if isinstance(p, str) and p.strip():
+            np = os.path.normpath(p)
+            if np not in normalized and os.path.isdir(np):
+                normalized.append(np)
+    if os.path.isdir(user_doc_path) and user_doc_path not in normalized:
+        normalized.append(user_doc_path)
+    return normalized if normalized else [user_doc_path]
+
+
+def _get_primary_loras_directory() -> str:
+    """Return the preferred directory for saving new LoRAs."""
+    dirs = _get_loras_directories()
+    for d in dirs:
+        if "documents" in d.lower() and "comfyui" in d.lower():
+            return d
+    return dirs[-1] if dirs else os.path.normpath("C:/Users/nyaac/Documents/ComfyUI/models/loras")
 
 
 async def _delete_lora_files(filename: str) -> dict:
-    """Delete a LoRA .safetensors file and its sidecar .json metadata.
-
-    Returns a dict with {deleted: bool, filename: str, removed: [paths], errors: [str]}
-    """
+    """Delete a LoRA .safetensors file, its dedicated folder, and sidecar metadata across all loras dirs."""
     result = {"deleted": False, "filename": filename, "removed": [], "errors": []}
     if not filename:
         result["errors"].append("Missing filename")
         return result
 
-    # Only allow basename to prevent path traversal
-    safe_name = os.path.basename(filename)
-    try:
-        loras_dir = _get_loras_directory()
-    except Exception as exc:  # noqa: BLE001
-        result["errors"].append(f"Cannot resolve loras path: {exc}")
-        return result
+    base_name = os.path.basename(filename).strip()
+    stem = os.path.splitext(base_name)[0]
 
-    target_path = os.path.join(loras_dir, safe_name)
-    # Sidecar metadata JSON placed next to LoRA file using stem
-    sidecar_path = os.path.join(loras_dir, f"{os.path.splitext(safe_name)[0]}.json")
+    all_dirs = _get_loras_directories()
+    deleted_any_model = False
 
-    # Delete LoRA file if exists
-    try:
-        if os.path.isfile(target_path):
-            os.remove(target_path)
-            result["removed"].append(target_path)
-        else:
-            result["errors"].append("LoRA file not found")
-    except Exception as exc:  # noqa: BLE001
-        result["errors"].append(f"Failed to delete LoRA file: {exc}")
+    for loras_dir in all_dirs:
+        # Possible candidate paths for the model file
+        candidate_safetensors = [
+            os.path.join(loras_dir, base_name),
+            os.path.join(loras_dir, f"{stem}.safetensors"),
+            os.path.join(loras_dir, f"{base_name}.safetensors"),
+            os.path.join(loras_dir, stem, f"{stem}.safetensors"),
+            os.path.join(loras_dir, stem, base_name),
+        ]
 
-    # Delete sidecar JSON if exists (best-effort)
-    try:
-        if os.path.isfile(sidecar_path):
-            os.remove(sidecar_path)
-            result["removed"].append(sidecar_path)
-    except Exception as exc:  # noqa: BLE001
-        result["errors"].append(f"Failed to delete sidecar JSON: {exc}")
+        for target_path in candidate_safetensors:
+            try:
+                if os.path.isfile(target_path):
+                    os.remove(target_path)
+                    result["removed"].append(target_path)
+                    deleted_any_model = True
+            except Exception as exc:
+                result["errors"].append(f"Failed to delete {target_path}: {exc}")
 
-    result["deleted"] = any(p.endswith(safe_name) or p.endswith(f"{os.path.splitext(safe_name)[0]}.json") for p in result["removed"]) and ("LoRA file not found" not in result["errors"]) 
+        # Delete root sidecars if exist
+        sidecar_candidates = [
+            os.path.join(loras_dir, f"{stem}.json"),
+            os.path.join(loras_dir, f"{stem}.metadata.json"),
+            os.path.join(loras_dir, f"{base_name}.json"),
+            os.path.join(loras_dir, f"{base_name}.metadata.json"),
+        ]
+        for p in sidecar_candidates:
+            try:
+                if os.path.isfile(p):
+                    os.remove(p)
+                    result["removed"].append(p)
+            except Exception as exc:
+                result["errors"].append(f"Failed to delete sidecar JSON: {exc}")
+
+        # Delete dedicated folder and its files if exists
+        lora_dir = os.path.join(loras_dir, stem)
+        try:
+            if os.path.isdir(lora_dir):
+                import shutil
+                shutil.rmtree(lora_dir, ignore_errors=True)
+                result["removed"].append(lora_dir)
+        except Exception as exc:
+            result["errors"].append(f"Failed to remove LoRA directory {lora_dir}: {exc}")
+
+    result["deleted"] = deleted_any_model or len(result["removed"]) > 0
     return result
 
 
 @PromptServer.instance.routes.post("/yuuka/lora/delete")
 async def yuuka_lora_delete(request):
-    """HTTP endpoint to delete a LoRA by filename on the ComfyUI host.
-
-    Body JSON: { filename: str }
-    """
+    """HTTP endpoint to delete a LoRA by filename on the ComfyUI host."""
     try:
         payload = await request.json()
     except Exception:
@@ -366,7 +448,6 @@ async def yuuka_lora_delete(request):
 
     result = await _delete_lora_files(filename)
     status = 200 if result.get("deleted") or "LoRA file not found" in result.get("errors", []) else 500
-    # If the main file was not found, we still return 200 to indicate idempotent success on removal intent.
     if "LoRA file not found" in result.get("errors", []):
         status = 200
     return web.json_response(result, status=status)
@@ -384,12 +465,9 @@ async def yuuka_lora_status(request):
     if not isinstance(filenames, list):
         return web.json_response({"status": {}}, status=200)
 
-    try:
-        loras_dir = _get_loras_directory()
-    except Exception as exc:  # noqa: BLE001
-        return web.json_response({"status": {}, "error": str(exc)}, status=500)
-
+    all_dirs = _get_loras_directories()
     status_map = {}
+
     for entry in filenames:
         if not isinstance(entry, str):
             continue
@@ -397,28 +475,202 @@ async def yuuka_lora_status(request):
         if not cleaned:
             continue
         safe_name = os.path.basename(cleaned)
-        target_path = os.path.join(loras_dir, safe_name)
-        status_map[safe_name] = os.path.isfile(target_path)
+        stem = os.path.splitext(safe_name)[0]
+
+        is_present = False
+        for loras_dir in all_dirs:
+            candidates = [
+                os.path.join(loras_dir, safe_name),
+                os.path.join(loras_dir, f"{stem}.safetensors"),
+                os.path.join(loras_dir, stem, f"{stem}.safetensors"),
+            ]
+            if any(os.path.isfile(c) for c in candidates):
+                is_present = True
+                break
+        status_map[safe_name] = is_present
 
     return web.json_response({"status": status_map}, status=200)
 
 
 @PromptServer.instance.routes.get("/yuuka/lora/list")
 async def yuuka_lora_list(_request):
-    """Return all LoRA filenames available on disk."""
-    try:
-        loras_dir = _get_loras_directory()
-    except Exception as exc:  # noqa: BLE001
-        return web.json_response({"files": [], "error": str(exc)}, status=500)
+    """Return all LoRA filenames available on disk across all directories."""
+    all_dirs = _get_loras_directories()
+    all_files = set()
 
-    try:
-        entries = [
-            name
-            for name in os.listdir(loras_dir)
-            if isinstance(name, str) and name.lower().endswith(".safetensors")
+    for loras_dir in all_dirs:
+        try:
+            for name in os.listdir(loras_dir):
+                if isinstance(name, str) and name.lower().endswith(".safetensors"):
+                    all_files.add(name)
+        except Exception:
+            pass
+
+    sorted_files = sorted(all_files)
+    return web.json_response({"files": sorted_files}, status=200)
+
+
+@PromptServer.instance.routes.get("/yuuka/lora/thumbnail")
+async def yuuka_lora_thumbnail(request):
+    """Serve local cached thumbnail image for a LoRA, downloading on-demand if needed."""
+    filename = request.query.get("filename", "").strip()
+    if not filename:
+        return web.Response(status=400, text="Missing filename")
+
+    safe_name = os.path.basename(filename)
+    stem = os.path.splitext(safe_name)[0]
+    all_dirs = _get_loras_directories()
+
+    # 1. Search candidate paths in all directories
+    for loras_dir in all_dirs:
+        lora_dir = os.path.join(loras_dir, stem)
+        candidates = [
+            os.path.join(lora_dir, f"{stem}.jpg"),
+            os.path.join(lora_dir, "thumbnail.jpg"),
+            os.path.join(lora_dir, f"{stem}.png"),
+            os.path.join(lora_dir, "thumbnail.png"),
+            os.path.join(lora_dir, "preview.png"),
+            os.path.join(loras_dir, f"{stem}.preview.png"),
+            os.path.join(loras_dir, f"{stem}.png"),
+            os.path.join(loras_dir, f"{stem}.jpg"),
         ]
-    except Exception as exc:  # noqa: BLE001
-        return web.json_response({"files": [], "error": str(exc)}, status=500)
+        for path in candidates:
+            if os.path.isfile(path) and os.path.getsize(path) > 0:
+                content_type = "image/png" if path.lower().endswith(".png") else "image/jpeg"
+                return web.FileResponse(path, headers={"Content-Type": content_type, "Cache-Control": "max-age=86400"})
 
-    entries.sort()
-    return web.json_response({"files": entries}, status=200)
+    # 2. On-demand caching if metadata exists
+    for loras_dir in all_dirs:
+        lora_dir = os.path.join(loras_dir, stem)
+        meta_candidates = [
+            os.path.join(lora_dir, f"{stem}.json"),
+            os.path.join(lora_dir, "metadata.json"),
+            os.path.join(loras_dir, f"{stem}.json"),
+            os.path.join(loras_dir, f"{stem}.metadata.json"),
+        ]
+        for meta_path in meta_candidates:
+            if os.path.isfile(meta_path):
+                try:
+                    with open(meta_path, "r", encoding="utf-8") as f:
+                        data = json.load(f)
+                    preview_url = ""
+                    versions = data.get("modelVersions", [])
+                    if versions and isinstance(versions, list) and isinstance(versions[0], dict):
+                        imgs = versions[0].get("images", [])
+                        if imgs and isinstance(imgs, list) and isinstance(imgs[0], dict):
+                            preview_url = imgs[0].get("url") or ""
+                    if not preview_url and data.get("preview_url"):
+                        preview_url = data.get("preview_url")
+
+                    if preview_url:
+                        os.makedirs(lora_dir, exist_ok=True)
+                        thumb_path = os.path.join(lora_dir, f"{stem}.jpg")
+                        resp = requests.get(preview_url, timeout=20)
+                        if resp.status_code == 200 and len(resp.content) > 0:
+                            with open(thumb_path, "wb") as f:
+                                f.write(resp.content)
+                            with open(os.path.join(lora_dir, "thumbnail.jpg"), "wb") as f:
+                                f.write(resp.content)
+                            return web.FileResponse(thumb_path, headers={"Content-Type": "image/jpeg", "Cache-Control": "max-age=86400"})
+                except Exception as exc:
+                    print(f"[Yuuka Lora Downloader] On-demand thumbnail download error for '{stem}': {exc}")
+
+    return web.Response(status=404, text="Thumbnail not found")
+
+
+@PromptServer.instance.routes.get("/yuuka/lora/models")
+async def yuuka_lora_models(_request):
+    """Return all LoRAs available on disk with their sidecar metadata and cached thumbnail URLs."""
+    all_dirs = _get_loras_directories()
+    models = {}
+
+    for loras_dir in all_dirs:
+        try:
+            for filename in os.listdir(loras_dir):
+                if not isinstance(filename, str) or not filename.lower().endswith(".safetensors"):
+                    continue
+                if filename in models:
+                    continue
+
+                stem = os.path.splitext(filename)[0]
+                lora_dir = os.path.join(loras_dir, stem)
+
+                # Metadata candidate paths
+                meta_candidates = [
+                    os.path.join(lora_dir, f"{stem}.json"),
+                    os.path.join(lora_dir, "metadata.json"),
+                    os.path.join(loras_dir, f"{stem}.json"),
+                    os.path.join(loras_dir, f"{stem}.metadata.json"),
+                ]
+
+                model_record = {
+                    "filename": filename,
+                    "name": stem,
+                    "civitai_url": "",
+                    "thumbnail": "",
+                    "remote_thumbnail": "",
+                    "base_model": "",
+                    "trained_words": [],
+                    "folder": stem,
+                    "available": True,
+                }
+
+                data = None
+                found_meta_path = None
+                for p in meta_candidates:
+                    if os.path.isfile(p):
+                        try:
+                            with open(p, "r", encoding="utf-8") as f:
+                                data = json.load(f)
+                                found_meta_path = p
+                                break
+                        except Exception:
+                            pass
+
+                if isinstance(data, dict):
+                    if found_meta_path and not os.path.isfile(os.path.join(lora_dir, "metadata.json")):
+                        try:
+                            os.makedirs(lora_dir, exist_ok=True)
+                            with open(os.path.join(lora_dir, "metadata.json"), "w", encoding="utf-8") as f:
+                                json.dump(data, f, indent=4)
+                        except Exception:
+                            pass
+
+                    model_id = data.get("id")
+                    if model_id:
+                        model_record["civitai_url"] = f"https://civitai.com/models/{model_id}"
+                    elif data.get("civitai_url"):
+                        model_record["civitai_url"] = data.get("civitai_url")
+
+                    if data.get("name"):
+                        model_record["name"] = data.get("name")
+
+                    versions = data.get("modelVersions", [])
+                    if versions and isinstance(versions, list) and isinstance(versions[0], dict):
+                        v0 = versions[0]
+                        model_record["base_model"] = v0.get("baseModel") or v0.get("base_model") or ""
+                        words = v0.get("trainedWords", [])
+                        if isinstance(words, list):
+                            model_record["trained_words"] = words
+                        elif isinstance(words, str):
+                            model_record["trained_words"] = [w.strip() for w in words.split(",") if w.strip()]
+                        imgs = v0.get("images", [])
+                        if imgs and isinstance(imgs, list) and isinstance(imgs[0], dict):
+                            model_record["remote_thumbnail"] = imgs[0].get("url") or ""
+
+                    if not model_record["remote_thumbnail"] and data.get("preview_url"):
+                        model_record["remote_thumbnail"] = data.get("preview_url")
+                    if not model_record["base_model"] and data.get("base_model") and data.get("base_model") != "Unknown":
+                        model_record["base_model"] = data.get("base_model")
+                    if not model_record["trained_words"] and data.get("trained_words"):
+                        model_record["trained_words"] = data.get("trained_words")
+
+                    # Local thumbnail endpoint
+                    model_record["thumbnail"] = f"/yuuka/lora/thumbnail?filename={filename}"
+
+                models[filename] = model_record
+        except Exception:
+            pass
+
+    return web.json_response({"models": models}, status=200)
+
